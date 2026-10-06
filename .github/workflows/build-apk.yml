@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - 'source.zip'
-      - '.github/workflows/**'
+      - '.github/workflows/build-apk.yml'
   workflow_dispatch:
 
 permissions:
@@ -13,6 +13,7 @@ permissions:
 env:
   REPO_NAME: BookmarkLauncher
   EXPECTED_CERT_SHA256: E5EF52E26F058D31549535A70407F61C8AF13D0A7DA4400FF635E8F385F7A493
+  MIN_VERSION_CODE: '64'
 
 jobs:
   build:
@@ -49,18 +50,57 @@ jobs:
       - name: Unpack source
         shell: bash
         run: |
+          set -euo pipefail
+          test -s source.zip
+          unzip -tq source.zip
           rm -rf project
           mkdir project
           unzip -q source.zip -d project
           test -f project/settings.gradle
+          test -f project/build.gradle
           test -f project/app/build.gradle
-          test -f project/scripts/prepare-build.sh
+          test -f project/app/src/main/AndroidManifest.xml
+          test -f project/keystore/bookmarks-launcher.jks
 
       - name: Repair and verify build invariants
         shell: bash
         run: |
+          set -euo pipefail
           cd project
-          bash scripts/prepare-build.sh
+
+          PROP=gradle.properties
+          touch "$PROP"
+          if grep -q '^android.useAndroidX=' "$PROP"; then
+            sed -i 's/^android\.useAndroidX=.*/android.useAndroidX=true/' "$PROP"
+          else
+            printf '\nandroid.useAndroidX=true\n' >> "$PROP"
+          fi
+          grep -qx 'android.useAndroidX=true' "$PROP"
+
+          find app/src/main/java -type f -name '*.java' -print0 | \
+            xargs -0 -r sed -i \
+              's/com\.google\.android\.gms\.mlkit\.vision\.codescanner/com.google.mlkit.vision.codescanner/g'
+
+          if grep -RIn --include='*.java' \
+            'com\.google\.android\.gms\.mlkit\.vision\.codescanner' app/src/main/java; then
+            echo 'ERROR: invalid ML Kit Code Scanner import remains' >&2
+            exit 1
+          fi
+
+          grep -q "implementation ['\"]com.google.android.gms:play-services-code-scanner:16.1.0['\"]" app/build.gradle
+          grep -q "applicationId ['\"]com.cmyk.bookmarkslauncher['\"]" app/build.gradle
+
+          VERSION_CODE=$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]+([0-9]+).*/\1/p' app/build.gradle | head -n1)
+          VERSION_NAME=$(sed -nE "s/.*versionName[[:space:]]+['\"]([^'\"]+)['\"].*/\1/p" app/build.gradle | head -n1)
+          test -n "$VERSION_CODE"
+          test -n "$VERSION_NAME"
+          test "$VERSION_CODE" -ge "$MIN_VERSION_CODE"
+
+          test -s keystore/bookmarks-launcher.jks
+          grep -q "storeFile file('../keystore/bookmarks-launcher.jks')" app/build.gradle
+          grep -q "keyAlias 'bookmarks'" app/build.gradle
+
+          echo "Verified version: $VERSION_NAME ($VERSION_CODE)"
 
       - name: Build debug APK
         run: gradle --no-daemon -p project :app:assembleDebug --stacktrace
@@ -68,18 +108,19 @@ jobs:
       - name: Verify fixed APK signature
         shell: bash
         run: |
+          set -euo pipefail
           APK=project/app/build/outputs/apk/debug/app-debug.apk
           test -s "$APK"
           APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
           "$APKSIGNER" verify --verbose --print-certs "$APK"
-          ACTUAL_CERT_SHA256=$("$APKSIGNER" verify --print-certs "$APK" \
+          ACTUAL_CERT_SHA256=$($APKSIGNER verify --print-certs "$APK" \
             | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
             | head -n1 \
             | tr '[:lower:]' '[:upper:]' \
             | tr -d ':[:space:]')
           test -n "$ACTUAL_CERT_SHA256"
           if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
-            echo "ERROR: signing certificate mismatch" >&2
+            echo 'ERROR: signing certificate mismatch' >&2
             echo "Expected: $EXPECTED_CERT_SHA256" >&2
             echo "Actual:   $ACTUAL_CERT_SHA256" >&2
             exit 1
@@ -88,12 +129,13 @@ jobs:
       - name: Name APK
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p out
           VERSION=$(sed -nE "s/.*versionName[[:space:]]+['\"]([^'\"]+)['\"].*/\1/p" project/app/build.gradle | head -n1)
           VERSION_CODE=$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]+([0-9]+).*/\1/p' project/app/build.gradle | head -n1)
           test -n "$VERSION"
           test -n "$VERSION_CODE"
-          test "$VERSION_CODE" -ge 63
+          test "$VERSION_CODE" -ge "$MIN_VERSION_CODE"
           cp project/app/build/outputs/apk/debug/app-debug.apk "out/BookmarkLauncher_${VERSION}.apk"
           test -s "out/BookmarkLauncher_${VERSION}.apk"
 
