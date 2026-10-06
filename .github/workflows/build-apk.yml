@@ -12,6 +12,7 @@ permissions:
 
 env:
   REPO_NAME: BookmarkLauncher
+  EXPECTED_CERT_SHA256: E5EF52E26F058D31549535A70407F61C8AF13D0A7DA4400FF635E8F385F7A493
 
 jobs:
   build:
@@ -19,10 +20,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -41,7 +42,7 @@ jobs:
             'build-tools;36.0.0'
 
       - name: Set up Gradle 9.6
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '9.6.0'
 
@@ -53,40 +54,51 @@ jobs:
           unzip -q source.zip -d project
           test -f project/settings.gradle
           test -f project/app/build.gradle
+          test -f project/scripts/prepare-build.sh
 
-      - name: Ensure AndroidX
+      - name: Repair and verify build invariants
         shell: bash
         run: |
-          PROP=project/gradle.properties
-          touch "$PROP"
-          if grep -q '^android.useAndroidX=' "$PROP"; then
-            sed -i 's/^android\.useAndroidX=.*/android.useAndroidX=true/' "$PROP"
-          else
-            printf '\nandroid.useAndroidX=true\n' >> "$PROP"
-          fi
-          grep -qx 'android.useAndroidX=true' "$PROP"
+          cd project
+          bash scripts/prepare-build.sh
 
       - name: Build debug APK
         run: gradle --no-daemon -p project :app:assembleDebug --stacktrace
 
-      - name: Verify APK signature
+      - name: Verify fixed APK signature
         shell: bash
         run: |
           APK=project/app/build/outputs/apk/debug/app-debug.apk
           test -s "$APK"
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          ACTUAL_CERT_SHA256=$("$APKSIGNER" verify --print-certs "$APK" \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+            | head -n1 \
+            | tr '[:lower:]' '[:upper:]' \
+            | tr -d ':[:space:]')
+          test -n "$ACTUAL_CERT_SHA256"
+          if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "ERROR: signing certificate mismatch" >&2
+            echo "Expected: $EXPECTED_CERT_SHA256" >&2
+            echo "Actual:   $ACTUAL_CERT_SHA256" >&2
+            exit 1
+          fi
 
       - name: Name APK
         shell: bash
         run: |
           mkdir -p out
           VERSION=$(sed -nE "s/.*versionName[[:space:]]+['\"]([^'\"]+)['\"].*/\1/p" project/app/build.gradle | head -n1)
+          VERSION_CODE=$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]+([0-9]+).*/\1/p' project/app/build.gradle | head -n1)
           test -n "$VERSION"
+          test -n "$VERSION_CODE"
+          test "$VERSION_CODE" -ge 63
           cp project/app/build/outputs/apk/debug/app-debug.apk "out/BookmarkLauncher_${VERSION}.apk"
           test -s "out/BookmarkLauncher_${VERSION}.apk"
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apk
           path: out/*.apk
